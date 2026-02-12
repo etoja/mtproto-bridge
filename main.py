@@ -23,17 +23,16 @@ STRING_SESSION = os.environ["TG_STRING_SESSION"]
 PAGER_URL = os.getenv("PAGER_INBOUND_URL", "https://pager.co.ua/api/webhooks/custom")
 PAGER_KEY = os.environ["PAGER_CHANNEL_KEY"]
 
-# ВАЖНО: должен быть публичный домен твоего Railway сервиса, например:
-# https://mtproto-bridge-production.up.railway.app
+# Пример: https://mtproto-bridge-production.up.railway.app
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 
-# Хранилище (лучше на Railway Volume)
+# Хранилище (без volume тоже работает, но файлы могут исчезать после рестарта)
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/data/media"))
 AVATAR_DIR = Path(os.getenv("AVATAR_DIR", "/data/avatars"))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 
-# Простой in-memory кэш аватарок: user_id -> url/None
+# Кэш аватаров в памяти: user_id -> url/None
 AVATAR_CACHE: dict[int, Optional[str]] = {}
 
 app = FastAPI()
@@ -62,28 +61,24 @@ def message_external_id(msg_id: int) -> str:
     return f"tg_msg:{msg_id}"
 
 
-def pager_attachment_type_from_telethon_event(event) -> str:
-    # Очень простой маппинг
+def pager_attachment_type_from_event(event) -> str:
     if getattr(event, "photo", None):
         return "image"
     if getattr(event, "video", None):
         return "video"
     if getattr(event, "audio", None):
         return "audio"
-    # документы, файлы
     return "file"
 
 
 async def save_telegram_media_and_get_attachments(event) -> list:
     """
-    Скачивает медиа из Telegram в MEDIA_DIR и возвращает Pager attachments[]:
-    [{type, payload:{url}}]
+    Скачивает медиа из Telegram в MEDIA_DIR и возвращает attachments[] для Pager.
     """
     if not getattr(event, "media", None):
         return []
 
-    att_type = pager_attachment_type_from_telethon_event(event)
-    # уникальное имя; telethon сам поставит расширение если сможет
+    att_type = pager_attachment_type_from_event(event)
     fname = f"{int(time.time())}_{uuid.uuid4().hex}"
     try:
         local_path = await event.download_media(file=str(MEDIA_DIR / fname))
@@ -101,28 +96,28 @@ async def save_telegram_media_and_get_attachments(event) -> list:
         return []
 
 
-async def get_userpic_url(sender) -> Optional[str]:
+async def get_userpic_url(user_or_chat) -> Optional[str]:
     """
-    Скачивает аватар пользователя (если есть) и возвращает публичный URL.
-    Кэширует в памяти.
+    Скачивает аватар (если есть) и возвращает публичный URL.
+    ВАЖНО: передавай сюда именно "клиента" (chat в private), а не sender.
     """
     try:
-        if not sender:
+        if not user_or_chat:
             return None
-        user_id = getattr(sender, "id", None)
+
+        user_id = getattr(user_or_chat, "id", None)
         if not user_id:
             return None
 
         if user_id in AVATAR_CACHE:
             return AVATAR_CACHE[user_id]
 
-        # нет фото — нечего качать
-        if not getattr(sender, "photo", None):
+        if not getattr(user_or_chat, "photo", None):
             AVATAR_CACHE[user_id] = None
             return None
 
         fname = f"avatar_{user_id}.jpg"
-        local_path = await tg.download_profile_photo(sender, file=str(AVATAR_DIR / fname))
+        local_path = await tg.download_profile_photo(user_or_chat, file=str(AVATAR_DIR / fname))
         if not local_path:
             AVATAR_CACHE[user_id] = None
             return None
@@ -160,20 +155,20 @@ async def on_new_message(event):
         if not event.is_private:
             return
 
-        sender = await event.get_sender()
-        peer_id = sender.id if sender else event.sender_id
+        # КЛЮЧЕВАЯ ПРАВКА:
+        # chat в private = всегда "второй человек" (клиент), даже если сообщение outgoing
+        chat = await event.get_chat()
+        peer_id = getattr(chat, "id", None) or event.sender_id
 
         direction = "outgoing" if event.out else "incoming"
         text = event.raw_text or ""
 
-        # 1) вложения
+        # вложения
         attachments = await save_telegram_media_and_get_attachments(event)
 
-        # 2) аватар
-        image_url = await get_userpic_url(sender)
-
-        # 3) имя
-        name = (getattr(sender, "first_name", None) or getattr(sender, "username", None) or None)
+        # имя и аватар клиента
+        name = (getattr(chat, "first_name", None) or getattr(chat, "username", None) or None)
+        image_url = await get_userpic_url(chat)
 
         payload = {
             "event": "message.created",
@@ -188,7 +183,6 @@ async def on_new_message(event):
             },
         }
 
-        # по документации Pager: name/imageUrl можно передавать при первом контакте или когда обновились
         if name:
             payload["client"]["name"] = name
         if image_url:
@@ -227,12 +221,12 @@ async def pager_outbound(request: Request, x_channel_key: str = Header(None)):
     try:
         last_sent_id = None
 
-        # 1) текст
+        # текст
         if text:
             sent = await tg.send_message(peer_id, text)
             last_sent_id = getattr(sent, "id", None)
 
-        # 2) вложения (Pager отдаёт URL — скачиваем и отправляем как файл)
+        # вложения (Pager присылает URL — скачиваем и отправляем)
         for a in attachments:
             url = (((a.get("payload") or {}).get("url")) or "").strip()
             if not url:
@@ -250,7 +244,6 @@ async def pager_outbound(request: Request, x_channel_key: str = Header(None)):
                 sent_file = await tg.send_file(peer_id, str(tmp_path))
                 last_sent_id = getattr(sent_file, "id", None)
 
-                # чистим временный файл
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except Exception:
@@ -259,8 +252,7 @@ async def pager_outbound(request: Request, x_channel_key: str = Header(None)):
             except Exception as e:
                 print("Pager attachment send error:", repr(e))
 
-        external_id = f"mtproto:{peer_id}:{last_sent_id or 'noid'}"
-        return {"externalMessageId": external_id}
+        return {"externalMessageId": f"mtproto:{peer_id}:{last_sent_id or 'noid'}"}
 
     except Exception as e:
         print("Pager->TG ERROR:", repr(e))
